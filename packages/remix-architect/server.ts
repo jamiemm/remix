@@ -13,13 +13,27 @@ import {
 } from "@remix-run/node";
 import type {
   APIGatewayProxyEventHeaders,
+  APIGatewayProxyEvent,
   APIGatewayProxyEventV2,
+  APIGatewayProxyHandler,
   APIGatewayProxyHandlerV2,
   APIGatewayProxyStructuredResultV2,
 } from "aws-lambda";
 
 import { isBinaryType } from "./binaryTypes";
+import {
+  sendRemixResponse as sendRemixResponseV2,
+  createRemixRequest as createRemixRequestV2
+} from "./api/v2";
+import {
+  createRemixRequest,
+  sendRemixResponse
+} from "./api/v1";
 
+export enum APIGatewayVersion {
+  v1 = "v1",
+  v2 = "v2",
+}
 /**
  * A function that returns the value to use as `context` in route `loader` and
  * `action` functions.
@@ -28,10 +42,10 @@ import { isBinaryType } from "./binaryTypes";
  * environment/platform-specific values through to your loader/action.
  */
 export type GetLoadContextFunction = (
-  event: APIGatewayProxyEventV2
+  event: APIGatewayProxyEventV2 | APIGatewayProxyEvent
 ) => AppLoadContext;
 
-export type RequestHandler = APIGatewayProxyHandlerV2;
+export type RequestHandler = APIGatewayProxyHandlerV2 | APIGatewayProxyHandler;
 
 /**
  * Returns a request handler for Architect that serves the response using
@@ -45,100 +59,20 @@ export function createRequestHandler({
   build: ServerBuild;
   getLoadContext?: GetLoadContextFunction;
   mode?: string;
+  apiGatewayVersion = APIGatewayVersion.v2;
 }): RequestHandler {
   let handleRequest = createRemixRequestHandler(build, mode);
 
-  return async (event) => {
-    let request = createRemixRequest(event);
+  return async (event: APIGatewayProxyEvent | APIGatewayProxyEventV2 /*, context*/) => {
+    let request = apiGatewayVersion === APIGatewayVersion.v1
+      ? createRemixRequest(event as APIGatewayProxyEvent)
+      : createRemixRequestV2(event as APIGatewayProxyEventV2);
     let loadContext = getLoadContext?.(event);
 
     let response = (await handleRequest(request, loadContext)) as NodeResponse;
 
-    return sendRemixResponse(response);
-  };
-}
-
-export function createRemixRequest(event: APIGatewayProxyEventV2): NodeRequest {
-  let host = event.headers["x-forwarded-host"] || event.headers.host;
-  let search = event.rawQueryString.length ? `?${event.rawQueryString}` : "";
-  let scheme = process.env.ARC_SANDBOX ? "http" : "https";
-  let url = new URL(event.rawPath + search, `${scheme}://${host}`);
-  let isFormData = event.headers["content-type"]?.includes(
-    "multipart/form-data"
-  );
-  // Note: No current way to abort these for Architect, but our router expects
-  // requests to contain a signal so it can detect aborted requests
-  let controller = new NodeAbortController();
-
-  return new NodeRequest(url.href, {
-    method: event.requestContext.http.method,
-    headers: createRemixHeaders(event.headers, event.cookies),
-    // Cast until reason/throwIfAborted added
-    // https://github.com/mysticatea/abort-controller/issues/36
-    signal: controller.signal as NodeRequestInit["signal"],
-    body:
-      event.body && event.isBase64Encoded
-        ? isFormData
-          ? Buffer.from(event.body, "base64")
-          : Buffer.from(event.body, "base64").toString()
-        : event.body,
-  });
-}
-
-export function createRemixHeaders(
-  requestHeaders: APIGatewayProxyEventHeaders,
-  requestCookies?: string[]
-): NodeHeaders {
-  let headers = new NodeHeaders();
-
-  for (let [header, value] of Object.entries(requestHeaders)) {
-    if (value) {
-      headers.append(header, value);
-    }
-  }
-
-  if (requestCookies) {
-    headers.append("Cookie", requestCookies.join("; "));
-  }
-
-  return headers;
-}
-
-export async function sendRemixResponse(
-  nodeResponse: NodeResponse
-): Promise<APIGatewayProxyStructuredResultV2> {
-  let cookies: string[] = [];
-
-  // Arc/AWS API Gateway will send back set-cookies outside of response headers.
-  for (let [key, values] of Object.entries(nodeResponse.headers.raw())) {
-    if (key.toLowerCase() === "set-cookie") {
-      for (let value of values) {
-        cookies.push(value);
-      }
-    }
-  }
-
-  if (cookies.length) {
-    nodeResponse.headers.delete("Set-Cookie");
-  }
-
-  let contentType = nodeResponse.headers.get("Content-Type");
-  let isBase64Encoded = isBinaryType(contentType);
-  let body: string | undefined;
-
-  if (nodeResponse.body) {
-    if (isBase64Encoded) {
-      body = await readableStreamToString(nodeResponse.body, "base64");
-    } else {
-      body = await nodeResponse.text();
-    }
-  }
-
-  return {
-    statusCode: nodeResponse.status,
-    headers: Object.fromEntries(nodeResponse.headers.entries()),
-    cookies,
-    body,
-    isBase64Encoded,
+    return apiGatewayVersion === APIGatewayVersion.v1
+      ? sendRemixResponse(response)
+      : sendRemixResponseV2(response);
   };
 }
